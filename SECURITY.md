@@ -40,7 +40,7 @@ the report.
 - Terminal escape, path, or label injection through ContextVeil output.
 - Configuration or integration installation that corrupts unrelated user or
   harness configuration.
-- Execution of untrusted content by the configuration or dotenv parsers.
+- Execution of untrusted content by the configuration, dotenv, or JSON parsers.
 
 ## Out Of Scope
 

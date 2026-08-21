@@ -21,8 +21,8 @@ struct Machine {
 }
 
 impl Machine {
-    /// A machine with the canary enrolled globally, in a project, and in a
-    /// wildcard dotenv file, so every source kind is exercised.
+    /// A machine with the canary enrolled through environment, dotenv, and JSON
+    /// references, so every source kind is exercised.
     fn new() -> Self {
         let canary = Canary::generate("LEAK_TOKEN");
         // The directory name must not contain any part of the canary: paths are
@@ -38,6 +38,7 @@ impl Machine {
         std::fs::create_dir_all(project.join("nested")).expect("project");
         std::fs::create_dir_all(home.join(".config").join("contextveil")).expect("config");
         std::fs::create_dir_all(home.join(".claude")).expect("claude");
+        std::fs::create_dir_all(home.join(".codex")).expect("codex");
 
         std::fs::write(
             home.join(".config").join("contextveil").join("config.toml"),
@@ -46,9 +47,19 @@ impl Machine {
         .expect("global config");
         std::fs::write(
             project.join(".contextveil.toml"),
-            "version = 1\n\n[[secret]]\nsource = \"dotenv\"\nfile = \".env\"\nall = true\n",
+            "version = 1\n\n[[secret]]\nsource = \"json\"\nfile = \"auth.json\"\npointer = \"/tokens/access_token\"\n\n[[secret]]\nsource = \"dotenv\"\nfile = \".env\"\nall = true\n",
         )
         .expect("project config");
+        std::fs::write(
+            project.join("auth.json"),
+            format!(r#"{{"tokens":{{"access_token":"{}"}}}}"#, canary.value()),
+        )
+        .expect("JSON source");
+        std::fs::write(
+            home.join(".codex").join("auth.json"),
+            format!(r#"{{"OPENAI_API_KEY":"{}"}}"#, canary.value()),
+        )
+        .expect("Known Source JSON");
         std::fs::write(
             project.join(".env"),
             format!(
@@ -119,10 +130,12 @@ impl Machine {
     /// except the dotenv source that legitimately holds it.
     fn assert_files_clean(&self) {
         let dotenv = self.project().join(".env");
+        let json = self.project().join("auth.json");
+        let known_source = self.home().join(".codex").join("auth.json");
         let notes = self.project().join("nested").join("notes.txt");
         let mut checked = 0;
         for path in walk(&self.home()) {
-            if path == dotenv || path == notes {
+            if path == dotenv || path == json || path == known_source || path == notes {
                 continue;
             }
             let Ok(bytes) = std::fs::read(&path) else {
@@ -288,6 +301,18 @@ fn a_complete_setup_run_writes_no_value_anywhere() {
     );
 
     assert_canary_absent("setup transcript", &transcript, &machine.canary);
+    let global = std::fs::read_to_string(
+        machine
+            .home()
+            .join(".config")
+            .join("contextveil")
+            .join("config.toml"),
+    )
+    .expect("global config");
+    assert!(
+        global.contains("~/.codex/auth.json"),
+        "the setup leak check must exercise Known Source persistence"
+    );
     // Every file ContextVeil wrote, including the installed hook and the
     // integration record, is value-free.
     machine.assert_files_clean();

@@ -2,7 +2,7 @@
 //!
 //! `SET-011`: search readable regular-file bytes under the current selected
 //! project root using the discovery exclusions, include ignored files, exclude
-//! the candidate's entire source dotenv file, never follow symlinks, and skip
+//! every equal-value alias source file, never follow symlinks, and skip
 //! special files. Occurrences are counted as non-overlapping exact byte matches
 //! from left to right, including inside binary or non-UTF-8 files.
 //!
@@ -10,6 +10,7 @@
 //! matched lines, or snippets. Findings are advisory (`DIA-004`), so skipped
 //! files need not be reported.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::sanitize;
@@ -50,11 +51,11 @@ impl Collisions {
     }
 }
 
-/// One value to search for, with the file that must be excluded from its search.
+/// One value to search for, with the files that must be excluded from its search.
 pub struct Subject<'a> {
     pub value: &'a str,
-    /// The candidate's own dotenv file, excluded in full (`SET-011`).
-    pub source_file: Option<&'a Path>,
+    /// Every known equal-value source file, excluded in full (`SET-011`).
+    pub source_files: &'a [PathBuf],
 }
 
 /// Counts occurrences of every subject under `project_root`.
@@ -67,7 +68,23 @@ pub fn analyze(project_root: &Path, subjects: &[Subject<'_>]) -> Vec<Collisions>
     if subjects.is_empty() {
         return results;
     }
-    scan(project_root, project_root, subjects, &mut results);
+    let canonical_sources: Vec<Vec<PathBuf>> = subjects
+        .iter()
+        .map(|subject| {
+            subject
+                .source_files
+                .iter()
+                .filter_map(|path| path.canonicalize().ok())
+                .collect()
+        })
+        .collect();
+    scan(
+        project_root,
+        project_root,
+        subjects,
+        &canonical_sources,
+        &mut results,
+    );
     for collisions in &mut results {
         collisions
             .files
@@ -76,7 +93,13 @@ pub fn analyze(project_root: &Path, subjects: &[Subject<'_>]) -> Vec<Collisions>
     results
 }
 
-fn scan(root: &Path, directory: &Path, subjects: &[Subject<'_>], results: &mut [Collisions]) {
+fn scan(
+    root: &Path,
+    directory: &Path,
+    subjects: &[Subject<'_>],
+    canonical_sources: &[Vec<PathBuf>],
+    results: &mut [Collisions],
+) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
@@ -94,20 +117,32 @@ fn scan(root: &Path, directory: &Path, subjects: &[Subject<'_>], results: &mut [
                 .to_str()
                 .is_some_and(|name| EXCLUDED_DIRECTORIES.contains(&name));
             if !excluded {
-                scan(root, &path, subjects, results);
+                scan(root, &path, subjects, canonical_sources, results);
             }
             continue;
         }
         if !metadata.is_file() {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(mut file) = std::fs::File::open(&path) else {
             // Unreadable files are skipped; analysis is advisory.
             continue;
         };
+        if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        if file.read_to_end(&mut bytes).is_err() {
+            continue;
+        }
         let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+        let canonical_path = path.canonicalize().ok();
         for (index, subject) in subjects.iter().enumerate() {
-            if subject.source_file == Some(path.as_path()) {
+            if subject.source_files.iter().any(|source| source == &path)
+                || canonical_path
+                    .as_ref()
+                    .is_some_and(|path| canonical_sources[index].contains(path))
+            {
                 continue;
             }
             let count = count_occurrences(&bytes, subject.value.as_bytes());
@@ -141,14 +176,16 @@ fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
 
 /// Convenience wrapper for one value.
 pub fn analyze_one(project_root: &Path, value: &str, source_file: Option<&Path>) -> Collisions {
-    analyze(project_root, &[Subject { value, source_file }])
-        .pop()
-        .unwrap_or_default()
-}
-
-/// The absolute path of a candidate's dotenv source file, if it has one.
-pub fn source_file(path: Option<&PathBuf>) -> Option<&Path> {
-    path.map(PathBuf::as_path)
+    let source_files: Vec<PathBuf> = source_file.map(Path::to_path_buf).into_iter().collect();
+    analyze(
+        project_root,
+        &[Subject {
+            value,
+            source_files: &source_files,
+        }],
+    )
+    .pop()
+    .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -222,6 +259,39 @@ mod tests {
     }
 
     #[test]
+    fn every_equal_value_alias_file_is_excluded() {
+        let tree = Tree::new();
+        let first = tree.file(".env", b"TOKEN=value\n");
+        let second = tree.file("config/auth.json", br#"{"token":"value"}"#);
+        tree.file("README.md", b"value");
+        let source_files = vec![first, second];
+
+        let collisions = analyze(
+            &tree.root,
+            &[Subject {
+                value: "value",
+                source_files: &source_files,
+            }],
+        );
+
+        assert_eq!(collisions[0].total, 1);
+        assert_eq!(collisions[0].files[0].0, "README.md");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_source_excludes_its_regular_project_target() {
+        let tree = Tree::new();
+        let target = tree.file("config/auth.json", br#"{"token":"value"}"#);
+        let source = tree.root.join("machine-auth.json");
+        std::os::unix::fs::symlink(&target, &source).expect("source symlink");
+
+        let collisions = analyze_one(&tree.root, "value", Some(&source));
+
+        assert!(collisions.is_empty());
+    }
+
+    #[test]
     fn binary_and_non_utf8_files_are_included() {
         let tree = Tree::new();
         tree.file("blob.bin", &[0x00, 0xff, b'v', b'a', b'l', 0xfe]);
@@ -292,15 +362,15 @@ mod tests {
             &[
                 Subject {
                     value: "alpha",
-                    source_file: None,
+                    source_files: &[],
                 },
                 Subject {
                     value: "beta",
-                    source_file: None,
+                    source_files: &[],
                 },
                 Subject {
                     value: "gamma",
-                    source_file: None,
+                    source_files: &[],
                 },
             ],
         );

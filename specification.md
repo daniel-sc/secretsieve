@@ -150,6 +150,11 @@ key = "STRIPE_API_KEY"
 source = "dotenv"
 file = "~/shared/project.env"
 all = true
+
+[[secret]]
+source = "json"
+file = "~/.codex/auth.json"
+pointer = "/tokens/access_token"
 ```
 
 Equivalent field naming changes before the first persisted implementation MAY be
@@ -168,6 +173,7 @@ resolution:
 environment:       (env, exact name)
 dotenv key:        (dotenv, normalized absolute path, exact key)
 dotenv wildcard:   (dotenv-all, normalized absolute path)
+JSON field:        (json, normalized absolute path, exact JSON Pointer)
 ```
 
 Repeated identical tuples within one file are duplicates. A keyed entry and a
@@ -216,6 +222,12 @@ and integration files unchanged.
 **CFG-015** Setup MUST preserve existing valid enrollment by default and permit
 deliberate removal. It MUST NOT remove an entry merely because the source is
 currently unresolved.
+
+**CFG-016** A JSON entry MUST contain `source = "json"`, one non-empty `file`,
+and one exact RFC 6901 JSON Pointer in its plain string form. The pointer MUST
+begin with `/`, MUST have a non-empty final reference token, and MUST NOT use the
+URI-fragment `#/...` form or wildcard extensions. It MUST NOT contain fields for
+another source type.
 
 ## 6. Source Resolution
 
@@ -274,6 +286,23 @@ MUST NOT be cached across hook processes or retained as rotation history.
 changes are observable only after the harness is restarted with the new
 environment.
 
+**SRC-011** A JSON resolver MUST read UTF-8 JSON and reject duplicate object
+member names at any nesting depth. It MUST resolve exactly one value selected by
+the configured JSON Pointer and MUST NOT perform wildcard traversal, key-name
+search, interpolation, decoding, or other transformation.
+
+**SRC-012** A selected non-empty JSON string is a resolved secret. A missing
+pointer, empty string, `null`, number, boolean, object, or array is unresolved.
+
+**SRC-013** An absent JSON file is unresolved. Permission denial, malformed or
+non-UTF-8 JSON, duplicate object members, or a non-`NotFound` I/O failure is a
+malfunction and MUST disable use of the entire effective registry for that
+event.
+
+**SRC-014** A JSON file referenced by multiple entries MUST be read and parsed
+once per event where practical. Its current contents MUST be resolved afresh for
+every intercepted event and MUST NOT be cached across hook processes.
+
 ## 7. Setup Discovery And Enrollment
 
 **SET-001** After TTY validation and successful preflight parsing of both
@@ -288,7 +317,7 @@ Each config phase MUST present existing entries as selected and provide a
 no-change path.
 
 **SET-002** Setup MUST automatically inspect the current process environment for
-name-gated candidates.
+candidates admitted by `SET-006`, `SET-017`, or a Known Source definition.
 
 **SET-003** Project dotenv discovery MUST recursively include regular files named
 `.env` or beginning `.env.`, including ignored and untracked files, when their
@@ -306,14 +335,15 @@ including `~/.claude`, `~/.codex`, `~/.copilot`, and
 general config directory.
 
 **SET-005** Both enrollment phases MUST allow manual dotenv paths, individual
-keys, wildcard file enrollment, and manual environment names. A currently absent
-manual file or key MAY be saved after explicit unresolved-source confirmation.
+keys, wildcard file enrollment, environment names, and JSON file/pointer pairs.
+A currently absent manual file, key, or pointer MAY be saved after explicit
+unresolved-source confirmation.
 
-**SET-006** Automatic suggestions MUST be gated by a maintained,
-case-insensitive secret-name vocabulary, including concepts such as token,
-secret, password, key, and credential. Format, entropy, length, and source type
-MAY rank or explain a name-gated candidate but MUST NOT independently introduce
-one.
+**SET-006** Except for `SET-017` and Known Source discovery, automatic
+suggestions MUST be gated by a maintained, case-insensitive secret-name
+vocabulary, including concepts such as token, secret, password, key, and
+credential. Format, entropy, length, and source type MAY rank or explain a
+name-gated candidate but MUST NOT independently introduce one.
 
 V1 name gating uses ASCII case folding. It splits the name into tokens at every
 run of non-ASCII-alphanumeric characters and also creates a compact form by
@@ -329,9 +359,10 @@ Characters outside ASCII are preserved for display but do not match the V1
 vocabulary. Vocabulary changes are observable setup behavior and MUST update
 this requirement and its fixtures.
 
-**SET-007** Name-gated candidates SHOULD be selected by default unless collision
+**SET-007** Automatic candidates SHOULD be selected by default unless collision
 analysis finds another occurrence. Candidates with collisions MUST be visible
-but unselected by default.
+but unselected by default. An already enrolled Candidate Group remains selected
+despite collisions.
 
 **SET-008** The user is authoritative. Setup MUST allow enrollment after a
 collision warning and MUST NOT impose a minimum runtime value length.
@@ -356,10 +387,16 @@ MUST NOT be shown.
 
 **SET-011** Collision analysis MUST search readable regular-file bytes under the
 current selected project root using the discovery exclusions. It MUST include
-ignored files, exclude the candidate's entire source dotenv file, not follow file
-or directory symlinks, and skip FIFOs, devices, sockets, and other special files.
-For each candidate it MUST count non-overlapping exact byte occurrences from
-left to right, including occurrences in binary or non-UTF-8 regular files.
+ignored files, exclude every whole source file known to contribute an equal-value
+alias to the Candidate Group, not follow file or directory symlinks, and skip
+FIFOs, devices, sockets, and other special files. For each Candidate Group it
+MUST count non-overlapping exact byte occurrences from left to right, including
+occurrences in binary or non-UTF-8 regular files.
+
+Alias-file discovery for these exclusions MUST consider resolvable sources and
+candidates from both enrollment phases even though Candidate Groups themselves
+remain phase-local. Exclusions MUST derive from all aliases known during
+discovery, not only the references currently selected in the setup UI.
 
 **SET-012** Collision output MUST show occurrence counts and affected sanitized
 relative filenames. It MUST NOT show values, matched lines, or snippets. Skipped
@@ -387,11 +424,93 @@ remaining actions, and return nonzero.
 menu after its numbered rows. When rows exist, the menu MUST list numeric row
 toggling before the other actions using a simple whitespace-separated example,
 such as `[1 3]   toggle row(s)`. Enrollment menus MUST list select-all,
-select-none, manual source additions, save, skip, and quit as separate actions.
+select-none, manual environment, dotenv, and JSON source additions, save, skip,
+and quit as separate actions.
 Integration menus MUST list apply, skip, and quit as separate actions. When a
 phase has no rows, row-specific toggling and bulk-selection actions MUST be
 omitted. The menu MUST be rendered again after each action that returns to the
 selection loop.
+
+**SET-016** Within one enrollment phase, setup MUST represent candidate source
+references with equal current resolved values as one Candidate Group. Selecting
+the group enrolls every represented reference; deselecting it removes every
+represented reference. If only some aliases were previously enrolled, the group
+MUST be selected and saving it MUST enroll all represented aliases. Skip remains
+the exact no-change path.
+
+Groups MUST NOT combine global and project references. Manual resolvable sources
+MUST join an equal-value group immediately. Unresolved sources and dotenv
+wildcard policies remain standalone. A selected wildcard suppresses redundant
+keyed candidates from its own file, and its current values contribute alias-file
+exclusions for equal-value groups elsewhere without placing the wildcard itself
+in a group.
+
+The earliest already enrolled reference in existing config order MUST remain
+first within a group. A wholly new group's canonical reference MUST be selected
+deterministically from candidate rank and source identity.
+
+Each Candidate Group MUST show one masked value preview and a sanitized
+description of every represented source. It MUST NOT show or derive a complete
+value or deterministic value fingerprint.
+
+**SET-017** Environment and discovered dotenv values that parse as absolute
+hierarchical URLs with an authority and a non-empty password in userinfo MUST be
+automatic candidates even when their source name does not pass `SET-006`. The
+complete URL value, not an extracted or decoded component, is enrolled. This
+value-shape rule MUST NOT recursively inspect JSON or any other structured
+source.
+
+**SET-018** A Known Source is setup-time discovery knowledge only. It MUST
+produce explicit source references and MUST NOT be persisted as runtime
+indirection. Path override environment variables are resolved during setup; a
+later override change requires setup to be rerun. Relative override values MUST
+resolve from setup's invocation directory. Override values MUST NOT receive
+shell, environment-variable, glob, or tilde expansion. See
+[`ADR-0001`](docs/adr/0001-persist-explicit-source-references.md).
+
+Known Source discovery MUST inspect exact machine paths, environment-resolved
+paths, and source-specific bounded directories only. It MUST NOT recursively
+crawl the home directory or search a project for generic basenames such as
+`auth.json` or `config.json`. One shared project traversal MUST recognize narrowly
+anchored project patterns at any depth using the exclusions in `SET-003`.
+Project traversal MUST NOT follow symlinks. An exact machine file path that is a
+symlink MUST be followed only when its target is a regular file.
+
+**SET-019** Valid JSON at a Known Source location with no recognized credential
+fields MUST be treated as an ordinary silent no-match, without an unsupported
+schema warning. Malformed, non-UTF-8, or unreadable automatically discovered
+files follow `SET-013`. Known Source JSON MUST use the strict JSON semantics in
+`SRC-011`; comment-bearing JSONC is malformed. Recognized fields MUST be exact
+and source-specific. A recognized dynamic object member MUST be representable as
+an exact JSON Pointer under `CFG-016`; an unrepresentable member name, including
+an empty name or `*`, MUST silently produce no candidate. Setup MUST NOT
+recursively classify arbitrary JSON strings by generic key substrings.
+
+**SET-020** The first Known Source set MUST cover only these explicitly listed V1
+representable primary and MCP plaintext stores, using the exact field
+vocabularies in [the Known Source inventory](docs/known-sources.md). Dynamic
+member names in those vocabularies are recognized only when they are
+representable under `CFG-016`:
+
+- Codex `CODEX_HOME` or `~/.codex` `auth.json` and `.credentials.json`;
+- OpenCode `XDG_DATA_HOME/opencode` or `~/.local/share/opencode` `auth.json` and
+  `mcp-auth.json`, plus a non-empty `OPENCODE_AUTH_CONTENT` as one whole
+  environment source rather than parsed derived references;
+- GitHub Copilot CLI `COPILOT_HOME` or `~/.copilot` strict-JSON `config.json`
+  `copilotTokens` fields and immediate `mcp-oauth-config` files whose basenames
+  are exactly 64 lowercase hexadecimal characters followed by `.tokens.json` or
+  `.json`;
+- Claude Code `CLAUDE_CONFIG_DIR` or `~/.claude` machine files, the default
+  `~/.claude.json` or override-root `.claude.json`, and project-anchored
+  `.claude/settings.json` and `.mcp.json`; primary `.credentials.json` discovery
+  is non-macOS only.
+
+Private or version-sensitive schemas MUST use narrowly recognized structures
+backed by pinned fixtures; unknown structures produce no candidate. ContextVeil
+MUST NOT query OS keychains or execute credential helpers. Copilot JSONC, raw
+`.secret` and `.verifier` files, and `mcp-secrets` fallback files are outside the
+V1 source formats and MUST NOT be claimed as discovered. macOS Claude primary
+credentials are keychain-backed and MUST NOT be claimed as discovered.
 
 ## 8. Effective Registry
 
@@ -405,7 +524,8 @@ otherwise the first global entry in file order. Doctor SHOULD report the aliases
 without values.
 
 **REG-003** Source and key names are case-sensitive. Safe placeholder labels MUST
-derive from the key/name only, never a path.
+derive from the environment name, dotenv key, or final JSON Pointer reference
+token only, never a file path.
 
 **REG-004** A label MUST preserve ASCII letters, digits, `_`, `-`, and `.` and
 replace every other non-empty run with `_`. Labels need not be globally unique.
@@ -602,7 +722,9 @@ hooks, approved/unapproved conflicts, executable availability, timeout settings,
 and synthetic protocol behavior.
 
 **DIA-004** Collision findings MUST be warnings only and MUST NOT change runtime
-enrollment or doctor exit status.
+enrollment or doctor exit status. Doctor MUST canonicalize equal resolved values
+in effective-registry order and exclude every enrolled alias source file using
+the same grouped semantics as `SET-011`.
 
 **DIA-005** Doctor MUST offer an optional paid/networked Claude live canary only.
 It MUST be disabled by default, require confirmation, use a conspicuous random
@@ -688,13 +810,14 @@ no recursive replacement.
 
 **TST-002** Config and source tests MUST cover strict unknown fields, duplicate
 identities, cross-scope duplicates, missing sources, empty values, non-UTF-8
-environment values, malformed/invalid-UTF-8 dotenv, duplicate keys, path
+environment values, malformed/invalid-UTF-8 dotenv and JSON, duplicate dotenv
+keys and JSON members, JSON Pointer escaping and wrong-type targets, path
 expansion, wildcard future keys, and all-or-nothing malfunction behavior.
 
 **TST-003** Filesystem tests MUST cover project-root selection, recursive ignored
-file discovery, exclusions, symlink traversal, collision source-file exclusion,
-permissions, atomic writes, invalid-config preservation, repeat setup, and
-partial multi-phase failure.
+file discovery, Known Source exact and anchored paths, exclusions, symlink
+traversal, grouped collision source-file exclusion, permissions, atomic writes,
+invalid-config preservation, repeat setup, and partial multi-phase failure.
 
 **TST-004** Every shipped adapter path MUST have protocol fixtures for clean,
 intervened, unresolved, malformed-input, diagnosed-malfunction, timeout mapping,

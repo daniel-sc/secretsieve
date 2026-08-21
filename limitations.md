@@ -159,20 +159,6 @@ result, and 201 active values over a 512 KiB payload all complete well inside th
 five-second host bound, and runtime cost is linear in input size rather than
 quadratic.
 
-### LIM-011: Limited Source Formats
-
-**Reality:** V1 resolves only inherited environment variables and dotenv files.
-It has no literal-value storage, JSON resolver, keychain integration, secret
-manager, shell-profile evaluation, or provider lookup.
-
-**Impact:** Credentials available only through other stores cannot be enrolled
-directly.
-
-**Workaround:** Expose the value through a dedicated environment variable or
-dotenv source without copying it into ContextVeil config.
-
-**Verification:** Strict config rejects unknown source types.
-
 ## Host Integration Limits
 
 ### LIM-012: Process Hooks Fail Open
@@ -394,6 +380,47 @@ expose the credential through an enrolled environment variable.
 or persisted. Its discovery half additionally creates the file, which runs only
 where the filesystem accepts a non-UTF-8 name; APFS rejects one, so macOS covers
 the reporting half alone.
+
+### LIM-023: Known Source Discovery Is Advisory
+
+**Reality:** Known Source discovery is setup-time, advisory, and version-sensitive;
+it is not an adapter coverage guarantee or a promise to find every host
+credential. It inspects only the exact machine paths and bounded project patterns
+in [`docs/known-sources.md`](docs/known-sources.md), then persists ordinary
+environment or exact JSON references. It accepts strict JSON only. Valid unknown
+schemas silently no-match; malformed matched JSON, including JSONC, is shown as
+unavailable. Recognized dynamic object members are candidates only when their
+names are representable as exact JSON Pointers under `CFG-016`; empty names and
+`*` silently no-match. Keychains and credential helpers are not queried.
+
+Copilot CLI 1.0.80 commonly writes a comment-bearing JSONC `config.json` that the
+V1 strict JSON resolver cannot enroll. Its raw `.secret` and `.verifier` files
+and `mcp-secrets` fallback files are not representable by V1 environment, dotenv,
+or JSON source references and are not discovered. On macOS, Claude's primary
+credentials are keychain-backed, so `.credentials.json` primary discovery is
+non-macOS only. Path overrides are resolved during setup; changes require a
+rerun. Relative overrides are invocation-directory relative and receive no
+shell, environment-variable, glob, or tilde expansion. These are source-format
+boundaries, not an implementation-not-present deviation.
+
+**Impact:** Setup may show a matched strict-JSON path as unavailable or silently
+omit a valid but unknown schema or an otherwise recognized dynamic member whose
+name cannot be represented by `CFG-016`. Credentials in Copilot's common
+JSONC/raw fallback stores, the macOS Claude keychain, a new third-party schema,
+an unusual path, or a changed override are not automatically suggested.
+Installing an adapter does not change this source-discovery boundary.
+
+**Workaround:** Review setup candidates, rerun setup after host or override
+changes, and manually enroll a supported environment, dotenv, or exact strict-JSON
+reference when one represents the value. Use host diagnostics and separate
+keychain controls for keychain- or helper-backed credentials. Copilot raw/JSONC
+stores require a future source format or another representable source.
+
+**Verification:** Unit fixtures pin every recognized field vocabulary and host
+version; filesystem and setup tests cover exact and anchored paths, override
+resolution, strict-JSON unavailability, silent unknown-schema no-match, symlink
+rules, explicit-reference persistence, and canary-free output. Documentation
+tests require the public matrices and pinned evidence links.
 
 ## Implementation Deviations
 

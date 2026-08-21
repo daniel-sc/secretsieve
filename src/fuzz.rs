@@ -82,8 +82,9 @@ pub fn context() -> Option<&'static Context> {
 pub type Target = fn(&[u8]);
 
 /// Every target, by name, for the smoke harness.
-pub const TARGETS: [(&str, Target); 8] = [
+pub const TARGETS: [(&str, Target); 9] = [
     ("dotenv", dotenv),
+    ("json-source", json_source),
     ("config", config),
     ("matcher", matcher),
     ("sanitize", sanitize),
@@ -107,6 +108,19 @@ pub fn dotenv(data: &[u8]) {
         for duplicate in parsed.duplicates() {
             assert!(parsed.get(duplicate).is_some());
         }
+    }
+}
+
+/// Strict JSON documents and exact pointer traversal (`SRC-011`, `TST-006`).
+pub fn json_source(data: &[u8]) {
+    let Ok(text) = std::str::from_utf8(data) else {
+        return;
+    };
+    let (pointer, document) = text.split_once('\n').unwrap_or((text, ""));
+    if crate::json::final_token(pointer).is_ok()
+        && let Ok(value) = crate::json::parse(document)
+    {
+        let _ = crate::json::select(&value, pointer);
     }
 }
 

@@ -10,6 +10,11 @@ A durable pointer naming where a protected value can be resolved without storing
 the value itself.
 _Avoid_: Secret snapshot, stored secret
 
+**Known Source**:
+A recognized class of secret-bearing local store that ContextVeil knows how to
+discover and interpret.
+_Avoid_: Named source, source adapter
+
 **Enrolled Source**:
 A source reference or file policy the user has chosen to protect.
 _Avoid_: Detected secret, scanned secret
@@ -18,6 +23,12 @@ _Avoid_: Detected secret, scanned secret
 A source that setup presents for possible enrollment based on discovery and
 advisory heuristics.
 _Avoid_: Detected secret, confirmed secret
+
+**Candidate Group**:
+A setup choice within one enrollment scope containing candidate source references
+whose currently resolved values are equal. Selecting the group enrolls every
+represented source.
+_Avoid_: Duplicate secret, merged source
 
 **Resolved Secret**:
 The current non-empty textual value obtained from an enrolled source.

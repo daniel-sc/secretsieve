@@ -11,7 +11,7 @@ use std::path::PathBuf;
 /// The path is already expanded and lexically normalized, without filesystem
 /// canonicalization or symlink resolution, so identity does not depend on
 /// filesystem state.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SourceId {
     /// An environment variable inherited by the hook process.
     Env { name: String },
@@ -19,6 +19,12 @@ pub enum SourceId {
     DotenvKey { path: PathBuf, key: String },
     /// Every current key in a dotenv file.
     DotenvAll { path: PathBuf },
+    /// One exact RFC 6901 pointer in a JSON file.
+    Json {
+        path: PathBuf,
+        pointer: String,
+        token: String,
+    },
 }
 
 impl SourceId {
@@ -37,6 +43,14 @@ impl SourceId {
         SourceId::DotenvAll { path }
     }
 
+    pub fn json(path: PathBuf, pointer: impl Into<String>, token: impl Into<String>) -> Self {
+        SourceId::Json {
+            path,
+            pointer: pointer.into(),
+            token: token.into(),
+        }
+    }
+
     /// The key or name a label derives from. Never a path (`REG-003`).
     ///
     /// A wildcard entry has no key of its own; each value it resolves carries
@@ -46,6 +60,7 @@ impl SourceId {
             SourceId::Env { name } => Some(name),
             SourceId::DotenvKey { key, .. } => Some(key),
             SourceId::DotenvAll { .. } => None,
+            SourceId::Json { token, .. } => Some(token),
         }
     }
 
@@ -53,7 +68,9 @@ impl SourceId {
     pub fn path(&self) -> Option<&PathBuf> {
         match self {
             SourceId::Env { .. } => None,
-            SourceId::DotenvKey { path, .. } | SourceId::DotenvAll { path } => Some(path),
+            SourceId::DotenvKey { path, .. }
+            | SourceId::DotenvAll { path }
+            | SourceId::Json { path, .. } => Some(path),
         }
     }
 
@@ -142,10 +159,16 @@ mod tests {
         );
         // A wildcard entry has no key, so it has no label.
         assert_eq!(SourceId::dotenv_all(PathBuf::from("/x/.env")).label(), None);
+        assert_eq!(
+            SourceId::json(PathBuf::from("/secret/auth.json"), "/a~1b", "a/b")
+                .label()
+                .as_deref(),
+            Some("a_b")
+        );
     }
 
     #[test]
-    fn identities_distinguish_the_three_source_kinds() {
+    fn identities_distinguish_source_kinds_and_json_pointers() {
         let path = PathBuf::from("/project/.env");
         assert_ne!(
             SourceId::dotenv_key(path.clone(), "A"),
@@ -153,9 +176,13 @@ mod tests {
         );
         assert_ne!(
             SourceId::dotenv_key(path.clone(), "A"),
-            SourceId::dotenv_key(path, "B")
+            SourceId::dotenv_key(path.clone(), "B")
         );
         assert_ne!(SourceId::env("A"), SourceId::env("a"));
+        assert_ne!(
+            SourceId::json(path.clone(), "/A", "A"),
+            SourceId::json(path, "/a", "a")
+        );
     }
 
     #[test]

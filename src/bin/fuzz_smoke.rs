@@ -17,7 +17,7 @@ use contextveil::fuzz;
 
 /// Seed inputs per target, chosen to be valid or nearly valid so mutation
 /// explores interesting states rather than mostly rejecting garbage.
-const SEEDS: [(&str, &[&str]); 8] = [
+const SEEDS: [(&str, &[&str]); 9] = [
     (
         "dotenv",
         &[
@@ -28,11 +28,21 @@ const SEEDS: [(&str, &[&str]); 8] = [
         ],
     ),
     (
+        "json-source",
+        &[
+            "/tokens/access_token\n{\"tokens\":{\"access_token\":\"value\"}}",
+            "/a~1b/~0key\n{\"a/b\":{\"~key\":\"value\"}}",
+            "/token\n{\"token\":\"first\",\"token\":\"second\"}",
+            "/missing\n[null,true,1,{},[]]",
+        ],
+    ),
+    (
         "config",
         &[
             "version = 1\n",
             "version = 1\n\n[[secret]]\nsource = \"env\"\nname = \"A\"\n",
             "version = 1\n\n[[secret]]\nsource = \"dotenv\"\nfile = \"~/.env\"\nall = true\n",
+            "version = 1\n\n[[secret]]\nsource = \"json\"\nfile = \"~/auth.json\"\npointer = \"/tokens/access_token\"\n",
             "version = 2\nunknown = true\n",
         ],
     ),

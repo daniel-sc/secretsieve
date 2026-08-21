@@ -11,6 +11,7 @@ pub mod config;
 pub mod diagnose;
 pub mod dotenv;
 pub mod integration;
+pub mod json;
 pub mod matcher;
 pub mod paths;
 pub mod redact;

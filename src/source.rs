@@ -1,9 +1,8 @@
 //! Source references and their resolution.
 //!
-//! V1 has two resolver families (`architecture.md`): environment variables
-//! inherited by the hook process and dotenv files parsed without interpolation
-//! or execution. A resolver returns resolved, unresolved, or malfunction; it
-//! never decides whether a value looks secret.
+//! V1 has environment, dotenv, and exact-pointer JSON resolver families
+//! (`architecture.md`). A resolver returns resolved, unresolved, or malfunction;
+//! it never decides whether a value looks secret.
 //!
 //! `SRC-009`: sources are resolved afresh for every event. The dotenv cache here
 //! exists only so one file referenced by several entries is read once per event;
@@ -16,6 +15,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use crate::dotenv::{self, Dotenv, ParseErrorKind};
+use crate::json;
 use crate::secret::{ResolvedSecret, SourceId};
 
 /// One enrolled source reference from a configuration file.
@@ -37,6 +37,12 @@ pub enum SourceRef {
         entered: String,
         path: PathBuf,
     },
+    Json {
+        entered: String,
+        path: PathBuf,
+        pointer: String,
+        token: String,
+    },
 }
 
 impl SourceRef {
@@ -45,14 +51,29 @@ impl SourceRef {
             SourceRef::Env { name } => SourceId::env(name.clone()),
             SourceRef::DotenvKey { path, key, .. } => SourceId::dotenv_key(path.clone(), key),
             SourceRef::DotenvAll { path, .. } => SourceId::dotenv_all(path.clone()),
+            SourceRef::Json {
+                path,
+                pointer,
+                token,
+                ..
+            } => SourceId::json(path.clone(), pointer, token),
         }
     }
 
-    /// The dotenv file this reference reads, if any.
+    /// The file this reference reads, if any.
     pub fn file(&self) -> Option<&Path> {
         match self {
             SourceRef::Env { .. } => None,
             SourceRef::DotenvKey { path, .. } | SourceRef::DotenvAll { path, .. } => Some(path),
+            SourceRef::Json { path, .. } => Some(path),
+        }
+    }
+
+    /// The dotenv file this reference reads, if any.
+    pub fn dotenv_file(&self) -> Option<&Path> {
+        match self {
+            SourceRef::DotenvKey { path, .. } | SourceRef::DotenvAll { path, .. } => Some(path),
+            SourceRef::Env { .. } | SourceRef::Json { .. } => None,
         }
     }
 }
@@ -67,10 +88,14 @@ pub enum Unresolved {
     Absent,
     /// The dotenv file exists but does not assign the key.
     KeyAbsent,
+    /// The configured JSON Pointer does not select a value.
+    PointerAbsent,
     /// The value exists but is empty.
     Empty,
     /// An environment value is not valid UTF-8 (`SRC-002`).
     NonUtf8,
+    /// The selected JSON value is not a string.
+    NotString,
 }
 
 impl Unresolved {
@@ -78,8 +103,10 @@ impl Unresolved {
         match self {
             Unresolved::Absent => "is not present",
             Unresolved::KeyAbsent => "is not assigned in its file",
+            Unresolved::PointerAbsent => "is not present at its JSON pointer",
             Unresolved::Empty => "is empty",
             Unresolved::NonUtf8 => "is not valid UTF-8",
+            Unresolved::NotString => "is not a string at its JSON pointer",
         }
     }
 }
@@ -93,6 +120,10 @@ pub enum SourceMalfunction {
     NotUtf8,
     /// The file does not match the dotenv grammar.
     Malformed { line: usize, kind: ParseErrorKind },
+    /// The file is not a complete valid JSON document.
+    MalformedJson,
+    /// The JSON document contains a duplicate object member.
+    DuplicateJsonMember,
 }
 
 impl SourceMalfunction {
@@ -103,6 +134,10 @@ impl SourceMalfunction {
             SourceMalfunction::NotUtf8 => "is not valid UTF-8".to_string(),
             SourceMalfunction::Malformed { line, kind } => {
                 format!("has a malformed assignment: line {line} {}", kind.reason())
+            }
+            SourceMalfunction::MalformedJson => "is malformed JSON".to_string(),
+            SourceMalfunction::DuplicateJsonMember => {
+                "contains a duplicate JSON object member".to_string()
             }
         }
     }
@@ -170,7 +205,7 @@ impl Environment {
 
     /// Every UTF-8 variable name in the snapshot, in unspecified order.
     ///
-    /// Setup inspects these for name-gated candidates (`SET-002`).
+    /// Setup inspects these for name-gated and URL-shaped candidates (`SET-002`).
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.variables.keys().filter_map(|name| name.to_str())
     }
@@ -191,10 +226,18 @@ enum FileState {
     Malfunction(SourceMalfunction),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum JsonFileState {
+    Missing,
+    Parsed(serde_json::Value),
+    Malfunction(SourceMalfunction),
+}
+
 /// Resolves source references, reading each dotenv file at most once per event.
 #[derive(Debug, Clone, Default)]
 pub struct Resolver {
     files: HashMap<PathBuf, FileState>,
+    json_files: HashMap<PathBuf, JsonFileState>,
 }
 
 impl Resolver {
@@ -261,6 +304,44 @@ impl Resolver {
                     ),
                 }
             }
+            SourceRef::Json {
+                path,
+                pointer,
+                token,
+                ..
+            } => {
+                let id = SourceId::json(path.clone(), pointer, token);
+                match self.json_file(path) {
+                    JsonFileState::Missing => Resolution::Unresolved {
+                        source: id,
+                        why: Unresolved::Absent,
+                    },
+                    JsonFileState::Malfunction(why) => Resolution::Malfunction {
+                        source: id,
+                        path: path.clone(),
+                        why: *why,
+                    },
+                    JsonFileState::Parsed(value) => match json::select(value, pointer) {
+                        None => Resolution::Unresolved {
+                            source: id,
+                            why: Unresolved::PointerAbsent,
+                        },
+                        Some(serde_json::Value::String(value)) if value.is_empty() => {
+                            Resolution::Unresolved {
+                                source: id,
+                                why: Unresolved::Empty,
+                            }
+                        }
+                        Some(serde_json::Value::String(value)) => {
+                            Resolution::Resolved(vec![ResolvedSecret::new(id, value.clone())])
+                        }
+                        Some(_) => Resolution::Unresolved {
+                            source: id,
+                            why: Unresolved::NotString,
+                        },
+                    },
+                }
+            }
         }
     }
 
@@ -278,6 +359,16 @@ impl Resolver {
             self.files.insert(path.to_path_buf(), state);
         }
         self.files.get(path).expect("the file was just inserted")
+    }
+
+    fn json_file(&mut self, path: &Path) -> &JsonFileState {
+        if !self.json_files.contains_key(path) {
+            let state = read_json(path);
+            self.json_files.insert(path.to_path_buf(), state);
+        }
+        self.json_files
+            .get(path)
+            .expect("the JSON file was just inserted")
     }
 }
 
@@ -298,6 +389,29 @@ fn read_dotenv(path: &Path) -> FileState {
             line: error.line,
             kind: error.kind,
         }),
+    }
+}
+
+fn read_json(path: &Path) -> JsonFileState {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return JsonFileState::Missing;
+        }
+        Err(_) => return JsonFileState::Malfunction(SourceMalfunction::Unreadable),
+    };
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => return JsonFileState::Malfunction(SourceMalfunction::NotUtf8),
+    };
+    match json::parse(&text) {
+        Ok(value) => JsonFileState::Parsed(value),
+        Err(json::ParseError::Malformed) => {
+            JsonFileState::Malfunction(SourceMalfunction::MalformedJson)
+        }
+        Err(json::ParseError::DuplicateMember) => {
+            JsonFileState::Malfunction(SourceMalfunction::DuplicateJsonMember)
+        }
     }
 }
 
@@ -377,6 +491,15 @@ mod tests {
     fn env_ref(name: &str) -> SourceRef {
         SourceRef::Env {
             name: name.to_string(),
+        }
+    }
+
+    fn json_ref(path: &Path, pointer: &str) -> SourceRef {
+        SourceRef::Json {
+            entered: path.to_string_lossy().into_owned(),
+            path: path.to_path_buf(),
+            pointer: pointer.to_string(),
+            token: crate::json::final_token(pointer).expect("valid test pointer"),
         }
     }
 
@@ -530,7 +653,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn an_unreadable_file_is_a_malfunction() {
+    fn unreadable_dotenv_and_json_files_are_malfunctions() {
         use std::os::unix::fs::PermissionsExt;
         let fixture = Fixture::new();
         let path = fixture.write(".env.locked", "A=1\n");
@@ -542,7 +665,15 @@ mod tests {
         // A privileged test runner can still read the file; skip in that case.
         if std::fs::read(&path).is_err() {
             assert!(matches!(
-                resolution,
+                &resolution,
+                Resolution::Malfunction {
+                    why: SourceMalfunction::Unreadable,
+                    ..
+                }
+            ));
+            let mut resolver = Resolver::new();
+            assert!(matches!(
+                resolver.resolve(&json_ref(&path, "/token"), &Environment::default()),
                 Resolution::Malfunction {
                     why: SourceMalfunction::Unreadable,
                     ..
@@ -584,6 +715,109 @@ mod tests {
                 assert!(!secrets[0].label.contains("secret-directory-name"));
             }
             other => panic!("expected a resolved secret, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_json_pointer_resolves_only_a_non_empty_string() {
+        let canary = Canary::generate("JSON_TOKEN");
+        let fixture = Fixture::new();
+        let path = fixture.write(
+            "auth.json",
+            &format!(
+                r#"{{"tokens":{{"access/token":"{}","empty":"","null":null,"number":1}}}}"#,
+                canary.value()
+            ),
+        );
+        let mut resolver = Resolver::new();
+        let environment = Environment::default();
+
+        match resolver.resolve(&json_ref(&path, "/tokens/access~1token"), &environment) {
+            Resolution::Resolved(secrets) => {
+                assert_eq!(secrets[0].value, canary.value());
+                assert_eq!(secrets[0].label, "access_token");
+                assert!(!secrets[0].label.contains("auth"));
+            }
+            other => panic!("expected a resolved JSON string, got {other:?}"),
+        }
+        assert!(matches!(
+            resolver.resolve(&json_ref(&path, "/tokens/missing"), &environment),
+            Resolution::Unresolved {
+                why: Unresolved::PointerAbsent,
+                ..
+            }
+        ));
+        assert!(matches!(
+            resolver.resolve(&json_ref(&path, "/tokens/empty"), &environment),
+            Resolution::Unresolved {
+                why: Unresolved::Empty,
+                ..
+            }
+        ));
+        for pointer in ["/tokens/null", "/tokens/number", "/tokens"] {
+            assert!(matches!(
+                resolver.resolve(&json_ref(&path, pointer), &environment),
+                Resolution::Unresolved {
+                    why: Unresolved::NotString,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn missing_malformed_non_utf8_and_duplicate_json_are_classified() {
+        let fixture = Fixture::new();
+        let malformed = fixture.write("malformed.json", r#"{"token":}"#);
+        let duplicate = fixture.write("duplicate.json", r#"{"token":"a","token":"b"}"#);
+        let invalid = fixture.path("invalid.json");
+        std::fs::write(&invalid, [b'{', b'"', 0xff, b'"', b':', b'1', b'}'])
+            .expect("write invalid UTF-8");
+        let environment = Environment::default();
+
+        let cases = [
+            (fixture.path("missing.json"), None),
+            (malformed, Some(SourceMalfunction::MalformedJson)),
+            (duplicate, Some(SourceMalfunction::DuplicateJsonMember)),
+            (invalid, Some(SourceMalfunction::NotUtf8)),
+        ];
+        for (path, malfunction) in cases {
+            let resolution = Resolver::new().resolve(&json_ref(&path, "/token"), &environment);
+            match malfunction {
+                None => assert!(matches!(
+                    resolution,
+                    Resolution::Unresolved {
+                        why: Unresolved::Absent,
+                        ..
+                    }
+                )),
+                Some(expected) => assert!(matches!(
+                    resolution,
+                    Resolution::Malfunction { why, .. } if why == expected
+                )),
+            }
+        }
+    }
+
+    #[test]
+    fn a_json_file_is_parsed_once_per_event_and_fresh_next_event() {
+        let fixture = Fixture::new();
+        let path = fixture.write("auth.json", r#"{"first":"one","second":"two"}"#);
+        let environment = Environment::default();
+        let mut resolver = Resolver::new();
+        assert!(matches!(
+            resolver.resolve(&json_ref(&path, "/first"), &environment),
+            Resolution::Resolved(_)
+        ));
+
+        std::fs::write(&path, r#"{"first":"changed","second":"changed"}"#).expect("rotate JSON");
+        match resolver.resolve(&json_ref(&path, "/second"), &environment) {
+            Resolution::Resolved(secrets) => assert_eq!(secrets[0].value, "two"),
+            other => panic!("expected cached event parse, got {other:?}"),
+        }
+        match Resolver::new().resolve(&json_ref(&path, "/second"), &environment) {
+            Resolution::Resolved(secrets) => assert_eq!(secrets[0].value, "changed"),
+            other => panic!("expected fresh event parse, got {other:?}"),
         }
     }
 }

@@ -328,6 +328,91 @@ fn diagnostics_contain_no_source_content() {
 }
 
 #[test]
+fn doctor_groups_aliases_and_excludes_all_of_their_source_files() {
+    let canary = Canary::generate("DOCTOR_ALIAS_TOKEN");
+    let machine = Machine::new();
+    std::fs::write(
+        machine.project().join(".env.one"),
+        format!("FIRST_TOKEN={}\n", canary.value()),
+    )
+    .expect("first dotenv");
+    std::fs::write(
+        machine.project().join(".env.two"),
+        format!("SECOND_TOKEN={}\n", canary.value()),
+    )
+    .expect("second dotenv");
+    std::fs::write(machine.project().join("README.md"), canary.value()).expect("README");
+    machine.write_global("version = 1\n\n[[secret]]\nsource = \"env\"\nname = \"GLOBAL_TOKEN\"\n");
+    std::fs::write(
+        machine.project().join(".contextveil.toml"),
+        "version = 1\n\n[[secret]]\nsource = \"dotenv\"\nfile = \".env.one\"\nkey = \"FIRST_TOKEN\"\n\n[[secret]]\nsource = \"dotenv\"\nfile = \".env.two\"\nkey = \"SECOND_TOKEN\"\n",
+    )
+    .expect("project config");
+    machine.install_hook("");
+
+    let doctor = machine.run("doctor", &[("GLOBAL_TOKEN", canary.value())]);
+    assert_eq!(doctor.status.code(), Some(0), "{}", text(&doctor));
+    let output = text(&doctor);
+    assert_eq!(output.matches("also occurs in this project").count(), 1);
+    assert!(output.contains("README.md x1"));
+    assert!(output.contains("2 aliases resolving to the same value"));
+    assert_canary_absent("grouped doctor stdout", &doctor.stdout, &canary);
+    assert_canary_absent("grouped doctor stderr", &doctor.stderr, &canary);
+}
+
+#[test]
+fn status_and_doctor_resolve_json_without_reporting_its_value_or_own_file() {
+    let canary = Canary::generate("JSON_DIAGNOSTIC_TOKEN");
+    let machine = Machine::new();
+    std::fs::write(
+        machine.project().join("auth.json"),
+        format!(r#"{{"tokens":{{"access/token":"{}"}}}}"#, canary.value()),
+    )
+    .expect("write JSON");
+    machine.write_global(
+        "version = 1\n\n[[secret]]\nsource = \"json\"\nfile = \"../../project/auth.json\"\npointer = \"/tokens/access~1token\"\n",
+    );
+    machine.install_hook("");
+
+    let status = machine.run("status", &[]);
+    assert_eq!(status.status.code(), Some(0));
+    assert!(text(&status).contains("active          1 value"));
+    assert_canary_absent("status stdout", &status.stdout, &canary);
+
+    let doctor = machine.run("doctor", &[]);
+    assert_eq!(doctor.status.code(), Some(0), "{}", text(&doctor));
+    assert!(text(&doctor).contains("1 value would be redacted"));
+    assert!(
+        !text(&doctor).contains("also occurs in this project"),
+        "the JSON source file must be excluded from its own collision: {}",
+        text(&doctor)
+    );
+    assert_canary_absent("doctor stdout", &doctor.stdout, &canary);
+    assert_canary_absent("doctor stderr", &doctor.stderr, &canary);
+}
+
+#[test]
+fn duplicate_json_members_are_a_secret_safe_doctor_failure() {
+    let canary = Canary::generate("DUPLICATE_JSON_TOKEN");
+    let machine = Machine::new();
+    std::fs::write(
+        machine.project().join("auth.json"),
+        format!(r#"{{"token":"{}","token":"other"}}"#, canary.value()),
+    )
+    .expect("write JSON");
+    machine.write_global(
+        "version = 1\n\n[[secret]]\nsource = \"json\"\nfile = \"../../project/auth.json\"\npointer = \"/token\"\n",
+    );
+    machine.install_hook("");
+
+    let doctor = machine.run("doctor", &[]);
+    assert_eq!(doctor.status.code(), Some(1));
+    assert!(text(&doctor).contains("duplicate JSON object member"));
+    assert_canary_absent("doctor stdout", &doctor.stdout, &canary);
+    assert_canary_absent("doctor stderr", &doctor.stderr, &canary);
+}
+
+#[test]
 fn the_project_root_follows_the_working_directory() {
     // `DIA-001` with `CFG-003`: the nearest ancestor project config is selected.
     let machine = Machine::new();

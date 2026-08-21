@@ -24,7 +24,7 @@ resolved explicitly before implementation continues.
 │ CLI                                                              │
 │ setup | status | doctor                                          │
 ├──────────────────────────────────────────────────────────────────┤
-│ enrollment | discovery | collision analysis | config editing     │
+│ enrollment | Known Source discovery | collision analysis         │
 ├──────────────────────────────────────────────────────────────────┤
 │ config loading | registry composition | source resolution        │
 ├──────────────────────────────────────────────────────────────────┤
@@ -51,8 +51,8 @@ The core owns:
 
 - config validation and project selection;
 - global and project registry composition;
-- environment and dotenv source resolution;
-- candidate scoring and collision analysis;
+- environment, dotenv, and exact-pointer JSON source resolution;
+- candidate grouping, scoring, and collision analysis;
 - canonicalization of duplicate resolved values;
 - exact matching and placeholder selection;
 - structured string-value traversal;
@@ -141,7 +141,10 @@ writer-locking mechanism is tactical.
 
 The minimum conceptual types are:
 
-- `SourceReference`: environment, one dotenv key, or all keys in a dotenv file;
+- `SourceReference`: environment, one dotenv key, all keys in a dotenv file, or
+  one exact JSON file pointer;
+- `KnownSource`: setup-time knowledge of bounded paths and credential fields that
+  produces explicit source references but is absent from runtime policy;
 - `Registry`: ordered source references from one config scope;
 - `ResolvedSecret`: a non-empty UTF-8 value plus source identity and safe label;
 - `EffectiveRegistry`: project entries followed by global entries for canonical
@@ -160,10 +163,10 @@ trusted machine/user policy. The project file is committable project policy and
 is automatically selected according to the specification.
 
 V1 deliberately allows project config to name environment sources and arbitrary
-dotenv paths. Therefore project config can cause host-file reads or disable the
-effective registry by being invalid. This is an accepted boundary documented in
-[limitations.md](limitations.md), not an invitation for adapters to weaken
-validation.
+supported source paths. Therefore project config can cause host-file reads or
+disable the effective registry by being invalid. This is an accepted boundary
+documented in [limitations.md](limitations.md), not an invitation for adapters to
+weaken validation.
 
 Integration ownership metadata may live in a separate file under the global
 ContextVeil config directory so policy TOML remains comprehensible. It must not
@@ -175,19 +178,52 @@ must not depend on setup having performed a migration.
 
 ## Source Resolvers
 
-V1 has two concrete resolver families:
+The current source expansion has three concrete resolver families:
 
 - environment variables inherited by the hook process;
-- dotenv files parsed without interpolation or execution.
+- dotenv files parsed without interpolation or execution;
+- JSON files selected by exact RFC 6901 pointer, parsed without duplicate object
+  members or transformations.
 
 Resolvers return resolved, unresolved, or malfunction. They do not decide
 whether a value looks secret. A dotenv file referenced by multiple entries must
 be read and parsed once per event where practical, but caching must not survive
 the process.
 
-Future JSON or other file formats should be implemented as additional source
-variants behind the same registry operation. Do not expose a public plugin API
-or dynamic resolver loading in anticipation.
+Additional file formats should be implemented as explicit source variants behind
+the same registry operation. The next planned variants are exact INI fields and
+npmrc entries. Do not expose a public plugin API or dynamic resolver loading in
+anticipation.
+
+## Known Source Discovery
+
+Known Sources belong to setup, not runtime. Their maintained path and schema
+knowledge yields ordinary environment, dotenv, or JSON source references. The
+persisted policy never names a Known Source, so changing a definition cannot
+silently change runtime reads; see
+[`ADR-0001`](docs/adr/0001-persist-explicit-source-references.md).
+
+The closed definitions and strict field vocabularies live in
+`src/setup/known_source.rs`. `src/setup/discovery.rs` performs one shared bounded
+project traversal for dotenv files and the anchored Claude
+`.claude/settings.json` and `.mcp.json` patterns. There is no runtime
+`KnownSource` variant: discovery emits existing `SourceReference` variants only.
+
+The first implementation is a closed list of direct discovery functions with
+small shared helpers. It is not a trait registry, manifest language, plugin API,
+or generic structured-file scanner. Machine stores use exact standard or
+setup-time environment-resolved paths. Project discovery performs one bounded
+walk and recognizes only source-specific anchored patterns. Valid unmatched
+structures are ordinary no-match results.
+
+Codex, OpenCode, Copilot, and Claude representable primary and MCP plaintext
+stores form the first Known Source release. Source-visible schemas use exact
+structural fields. Private schemas use per-tool exact vocabularies and pinned
+fixtures; they never authorize generic recursive secret-name matching in
+unrelated JSON. The maintained matrix and evidence are in
+[`docs/known-sources.md`](docs/known-sources.md). JSONC, raw sidecar formats,
+keychains, helper execution, decoded representations, and other transformations
+remain outside this discovery layer.
 
 ## Matcher
 

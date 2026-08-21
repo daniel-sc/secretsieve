@@ -1,4 +1,4 @@
-//! Dotenv discovery for setup.
+//! Bounded project and dotenv discovery for setup.
 //!
 //! `SET-003` governs recursive project discovery and `SET-004` the bounded
 //! global probe. Both refuse to follow symlinks or touch special files, so
@@ -63,6 +63,14 @@ pub struct Discovered {
     pub state: State,
 }
 
+/// Files recognized during the one bounded project traversal.
+#[derive(Debug, Default)]
+pub struct ProjectFiles {
+    pub dotenv: Vec<Discovered>,
+    pub claude_settings: Vec<PathBuf>,
+    pub claude_mcp: Vec<PathBuf>,
+}
+
 /// Whether a discovered file can be offered as a candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {
@@ -124,13 +132,22 @@ fn is_dotenv_file_name(name: &std::ffi::OsStr) -> bool {
 /// Ignored and untracked files are included deliberately: a credential is just
 /// as reachable whether or not version control tracks it.
 pub fn project_dotenv_files(project_root: &Path) -> Vec<Discovered> {
-    let mut found = Vec::new();
+    project_files(project_root).dotenv
+}
+
+/// Collects dotenv and narrowly anchored Known Source paths in one walk.
+pub fn project_files(project_root: &Path) -> ProjectFiles {
+    let mut found = ProjectFiles::default();
     walk(project_root, project_root, &mut found);
-    found.sort_by(|left, right| left.path.cmp(&right.path));
+    found
+        .dotenv
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    found.claude_settings.sort();
+    found.claude_mcp.sort();
     found
 }
 
-fn walk(root: &Path, directory: &Path, found: &mut Vec<Discovered>) {
+fn walk(root: &Path, directory: &Path, found: &mut ProjectFiles) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
@@ -158,10 +175,17 @@ fn walk(root: &Path, directory: &Path, found: &mut Vec<Discovered>) {
             // FIFOs, devices, sockets, and other special files are never read.
             continue;
         }
-        if !is_dotenv_file_name(&entry.file_name()) {
-            continue;
+        if is_dotenv_file_name(&entry.file_name()) {
+            found
+                .dotenv
+                .push(inspect(&path, relative_entry(root, &path)));
+        } else if entry.file_name() == "settings.json"
+            && path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new(".claude"))
+        {
+            found.claude_settings.push(path);
+        } else if entry.file_name() == ".mcp.json" {
+            found.claude_mcp.push(path);
         }
-        found.push(inspect(&path, relative_entry(root, &path)));
     }
 }
 
@@ -315,6 +339,24 @@ mod tests {
         assert!(names.contains(&".env.local".to_string()));
         assert!(names.iter().any(|name| name.ends_with(".env.production")));
         assert_eq!(found.len(), 3);
+    }
+
+    #[test]
+    fn one_project_walk_collects_only_anchored_known_source_json() {
+        let tree = Tree::new();
+        tree.file("app/.claude/settings.json", "{}");
+        tree.file("app/.mcp.json", "{}");
+        tree.file("app/settings.json", "{}");
+        tree.file("app/auth.json", "{}");
+        tree.file("app/.claude/nested/settings.json", "{}");
+
+        let found = project_files(&tree.root);
+        assert_eq!(
+            found.claude_settings,
+            vec![tree.root.join("app/.claude/settings.json")]
+        );
+        assert_eq!(found.claude_mcp, vec![tree.root.join("app/.mcp.json")]);
+        assert!(found.dotenv.is_empty());
     }
 
     #[test]

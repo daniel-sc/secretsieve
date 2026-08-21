@@ -232,7 +232,7 @@ impl Snapshot {
 
         let mut duplicate_keys: Vec<(PathBuf, Vec<String>)> = Vec::new();
         for (source, _) in &resolutions {
-            if let Some(path) = source.file() {
+            if let Some(path) = source.dotenv_file() {
                 let duplicates = resolver.duplicate_keys(path);
                 if !duplicates.is_empty() && !duplicate_keys.iter().any(|(known, _)| known == path)
                 {
@@ -471,29 +471,54 @@ impl Snapshot {
 
     /// Current project collisions, always advisory (`DIA-003`, `DIA-004`).
     fn collision_findings(&self) -> Vec<Finding> {
-        let mut subjects = Vec::new();
-        let mut labels = Vec::new();
+        struct Group<'a> {
+            value: &'a str,
+            label: String,
+            source_files: Vec<PathBuf>,
+        }
+        let mut groups: Vec<Group<'_>> = Vec::new();
         for (source, resolution) in &self.resolutions {
             if let Resolution::Resolved(secrets) = resolution {
                 for secret in secrets {
-                    subjects.push(collision::Subject {
-                        value: &secret.value,
-                        source_file: source.file(),
-                    });
-                    labels.push(describe_source(&secret.source));
+                    if let Some(group) = groups.iter_mut().find(|group| group.value == secret.value)
+                    {
+                        if let Some(file) = source.file()
+                            && !group.source_files.iter().any(|known| known == file)
+                        {
+                            group.source_files.push(file.to_path_buf());
+                        }
+                    } else {
+                        groups.push(Group {
+                            value: &secret.value,
+                            label: describe_source(&secret.source),
+                            source_files: source
+                                .file()
+                                .map(Path::to_path_buf)
+                                .into_iter()
+                                .collect(),
+                        });
+                    }
                 }
             }
         }
-        if subjects.is_empty() {
+        if groups.is_empty() {
             return Vec::new();
         }
+        let subjects: Vec<collision::Subject<'_>> = groups
+            .iter()
+            .map(|group| collision::Subject {
+                value: group.value,
+                source_files: &group.source_files,
+            })
+            .collect();
         collision::analyze(&self.project_root, &subjects)
             .into_iter()
-            .zip(labels)
+            .zip(groups)
             .filter(|(collisions, _)| !collisions.is_empty())
-            .map(|(collisions, label)| {
+            .map(|(collisions, group)| {
                 Finding::warning(format!(
-                    "{label} also occurs in this project: {}",
+                    "{} also occurs in this project: {}",
+                    group.label,
                     collisions.describe()
                 ))
             })
@@ -727,6 +752,11 @@ fn describe_source(id: &SourceId) -> String {
         SourceId::DotenvAll { path } => {
             format!("dotenv {} (every key)", sanitize::path(path))
         }
+        SourceId::Json { path, pointer, .. } => format!(
+            "json {} pointer {}",
+            sanitize::path(path),
+            sanitize::text(pointer)
+        ),
     }
 }
 

@@ -57,6 +57,8 @@ struct SecretOut {
     key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     all: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pointer: Option<String>,
 }
 
 /// Renders a configuration file exactly as it will be persisted.
@@ -72,6 +74,7 @@ pub fn render(sources: &[SourceRef]) -> Result<String, WriteError> {
                     file: None,
                     key: None,
                     all: None,
+                    pointer: None,
                 },
                 SourceRef::DotenvKey { entered, key, .. } => SecretOut {
                     source: "dotenv",
@@ -79,6 +82,7 @@ pub fn render(sources: &[SourceRef]) -> Result<String, WriteError> {
                     file: Some(entered.clone()),
                     key: Some(key.clone()),
                     all: None,
+                    pointer: None,
                 },
                 SourceRef::DotenvAll { entered, .. } => SecretOut {
                     source: "dotenv",
@@ -86,6 +90,17 @@ pub fn render(sources: &[SourceRef]) -> Result<String, WriteError> {
                     file: Some(entered.clone()),
                     key: None,
                     all: Some(true),
+                    pointer: None,
+                },
+                SourceRef::Json {
+                    entered, pointer, ..
+                } => SecretOut {
+                    source: "json",
+                    name: None,
+                    file: Some(entered.clone()),
+                    key: None,
+                    all: None,
+                    pointer: Some(pointer.clone()),
                 },
             })
             .collect(),
@@ -198,6 +213,12 @@ mod tests {
             SourceRef::DotenvAll {
                 entered: "~/shared/project.env".to_string(),
                 path: PathBuf::from("/home/user/shared/project.env"),
+            },
+            SourceRef::Json {
+                entered: "~/.codex/auth.json".to_string(),
+                path: PathBuf::from("/home/user/.codex/auth.json"),
+                pointer: "/tokens/access_token".to_string(),
+                token: "access_token".to_string(),
             },
         ]
     }

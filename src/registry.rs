@@ -151,7 +151,7 @@ pub fn build(environment: &Environment, project_root: Option<&Path>) -> Outcome 
 
     let mut duplicate_keys = Vec::new();
     for reference in &ordered {
-        if let Some(path) = reference.file() {
+        if let Some(path) = reference.dotenv_file() {
             let duplicates = resolver.duplicate_keys(path);
             if !duplicates.is_empty()
                 && !duplicate_keys
@@ -403,6 +403,40 @@ mod tests {
             malfunction(fixture.build(&[("TOKEN", "value")])),
             Malfunction::Source {
                 why: SourceMalfunction::Malformed { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn json_sources_are_active_and_malformed_json_disables_every_pattern() {
+        let canary = Canary::generate("JSON_ACCESS_TOKEN");
+        let fixture = Fixture::new();
+        fixture.write_global("version = 1\n\n[[secret]]\nsource = \"env\"\nname = \"TOKEN\"\n");
+        fixture.write_project(
+            "version = 1\n\n[[secret]]\nsource = \"json\"\nfile = \"auth.json\"\npointer = \"/tokens/access_token\"\n",
+        );
+        fixture.write_file(
+            "auth.json",
+            &format!(r#"{{"tokens":{{"access_token":"{}"}}}}"#, canary.value()),
+        );
+
+        let registry = ready(fixture.build(&[("TOKEN", "other-value")]));
+        assert_eq!(registry.redactor.active_count(), 2);
+        let mut tally = registry.redactor.tally();
+        assert_eq!(
+            registry
+                .redactor
+                .redact(canary.value(), &mut tally)
+                .as_deref(),
+            Some("<SECRET:access_token>")
+        );
+
+        fixture.write_file("auth.json", r#"{"token":"a","token":"b"}"#);
+        assert!(matches!(
+            malfunction(fixture.build(&[("TOKEN", "other-value")])),
+            Malfunction::Source {
+                why: SourceMalfunction::DuplicateJsonMember,
                 ..
             }
         ));

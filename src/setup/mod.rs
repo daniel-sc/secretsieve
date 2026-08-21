@@ -11,15 +11,17 @@
 //! `crate::sanitize` (`SEC-006`).
 
 pub mod collision;
+pub mod credential_url;
 pub mod discovery;
 pub mod integrations;
+pub mod known_source;
 pub mod preview;
 pub mod ui;
 pub mod vocabulary;
 pub mod write;
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::cli::Exit;
 use crate::config::{self, Config, ConfigError, Load};
@@ -85,14 +87,47 @@ pub fn run(
         Err(exit) => return exit,
     };
 
+    let project_files = discovery::project_files(&project_root);
+
+    // Discover both scopes before presenting either phase. Candidate Groups stay
+    // phase-local, while collision exclusions can account for aliases in both
+    // scopes (`SET-011`, `SET-016`).
+    let (global_items, global_notices) = build_items(
+        Scope::Global,
+        &global,
+        &project_root,
+        environment,
+        home.as_deref(),
+        current_directory,
+        &project_files,
+    );
+    let (project_items, project_notices) = build_items(
+        Scope::Project,
+        &project,
+        &project_root,
+        environment,
+        home.as_deref(),
+        current_directory,
+        &project_files,
+    );
+    let mut aliases = alias_inventory([
+        (Scope::Global, global_items.as_slice()),
+        (Scope::Project, project_items.as_slice()),
+    ]);
+
     let global_result = enrollment_phase(
         terminal,
         Scope::Global,
         &global,
-        &global_path,
-        &project_root,
-        environment,
-        home.as_deref(),
+        global_items,
+        global_notices,
+        EnrollmentContext {
+            config_path: &global_path,
+            project_root: &project_root,
+            environment,
+            home: home.as_deref(),
+            aliases: &mut aliases,
+        },
     );
     let global_sources = match global_result {
         PhaseResult::Kept(sources) | PhaseResult::Saved(sources) => sources,
@@ -103,10 +138,15 @@ pub fn run(
         terminal,
         Scope::Project,
         &project,
-        &project_path,
-        &project_root,
-        environment,
-        home.as_deref(),
+        project_items,
+        project_notices,
+        EnrollmentContext {
+            config_path: &project_path,
+            project_root: &project_root,
+            environment,
+            home: home.as_deref(),
+            aliases: &mut aliases,
+        },
     );
     let project_sources = match project_result {
         PhaseResult::Kept(sources) | PhaseResult::Saved(sources) => sources,
@@ -179,24 +219,36 @@ enum PhaseResult {
     Stopped(Exit),
 }
 
+struct EnrollmentContext<'a> {
+    config_path: &'a Path,
+    project_root: &'a Path,
+    environment: &'a Environment,
+    home: Option<&'a Path>,
+    aliases: &'a mut AliasInventory,
+}
+
 /// One enrollment phase.
 fn enrollment_phase(
     terminal: &mut Terminal<'_>,
     scope: Scope,
     existing: &Config,
-    config_path: &Path,
-    project_root: &Path,
-    environment: &Environment,
-    home: Option<&Path>,
+    mut items: Vec<Item>,
+    notices: Vec<known_source::Notice>,
+    mut context: EnrollmentContext<'_>,
 ) -> PhaseResult {
-    let mut items = build_items(scope, existing, project_root, environment, home);
-    annotate_collisions(&mut items, project_root);
+    refresh_items(scope, &mut items, &mut context);
 
     terminal.line(scope.title());
-    terminal.line(&format!("  file: {}", sanitize::path(config_path)));
+    terminal.line(&format!("  file: {}", sanitize::path(context.config_path)));
+    for notice in notices {
+        terminal.line(&format!(
+            "  unavailable: {} ({})",
+            notice.display, notice.reason
+        ));
+    }
     loop {
         render(terminal, &items);
-        render_actions(terminal, items.len());
+        render_actions(terminal, visible_count(&items));
         let answer = match terminal.ask(">") {
             Ok(answer) => answer,
             Err(Cancelled) => return cancelled(terminal),
@@ -211,7 +263,7 @@ fn enrollment_phase(
                     continue;
                 }
                 let selected = selected_sources(&items);
-                return match write::write(config_path, &selected, scope == Scope::Global) {
+                return match write::write(context.config_path, &selected, scope == Scope::Global) {
                     Ok(changed) => {
                         terminal.line(if changed {
                             "Saved."
@@ -224,7 +276,7 @@ fn enrollment_phase(
                     Err(error) => {
                         terminal.line(&format!(
                             "contextveil: `{}` could not be written because {}.",
-                            sanitize::path(config_path),
+                            sanitize::path(context.config_path),
                             error.reason()
                         ));
                         PhaseResult::Stopped(Exit::Failure)
@@ -241,28 +293,28 @@ fn enrollment_phase(
                 for item in &mut items {
                     if item.problem.is_none() {
                         item.selected = true;
+                        item.selection_touched = true;
                     }
                 }
+                refresh_items(scope, &mut items, &mut context);
             }
             "n" => {
                 for item in &mut items {
                     item.selected = false;
+                    item.selection_touched = true;
                 }
+                refresh_items(scope, &mut items, &mut context);
             }
-            "e" | "k" | "w" => {
-                match add_manual(
-                    terminal,
-                    answer.trim(),
-                    &mut items,
-                    config_path,
-                    home,
-                    environment,
-                ) {
+            "e" | "k" | "w" | "j" => {
+                match add_manual(terminal, answer.trim(), scope, &mut items, &mut context) {
                     Ok(()) => {}
                     Err(Cancelled) => return cancelled(terminal),
                 }
             }
-            selection => toggle(terminal, &mut items, selection),
+            selection => {
+                toggle(terminal, &mut items, selection);
+                refresh_items(scope, &mut items, &mut context);
+            }
         }
     }
 }
@@ -273,9 +325,16 @@ fn cancelled(terminal: &mut Terminal<'_>) -> PhaseResult {
     PhaseResult::Stopped(Exit::Failure)
 }
 
-/// One selectable line in a phase.
-struct Item {
+struct Member {
     source: SourceRef,
+    enrolled: bool,
+    suppressed: bool,
+}
+
+/// One selectable row in a phase. Singular equal-value references share a row;
+/// unresolved references and wildcard policies remain standalone (`SET-016`).
+struct Item {
+    members: Vec<Member>,
     enrolled: bool,
     selected: bool,
     /// Masked preview and explanatory signals, when the source resolves.
@@ -284,13 +343,50 @@ struct Item {
     problem: Option<String>,
     /// The resolved value, kept only in memory for collision analysis.
     value: Option<String>,
+    resolved: bool,
+    /// Current values from a wildcard policy. They never make the wildcard a
+    /// Candidate Group member, but can exclude its file for other groups.
+    wildcard_values: Vec<String>,
     collisions: Option<Collisions>,
+    /// Whether the user explicitly chose this row rather than accepting setup's
+    /// collision-derived default.
+    selection_touched: bool,
+    known_source: bool,
 }
 
 impl Item {
     fn description(&self) -> String {
-        describe(&self.source)
+        let visible: Vec<&Member> = self
+            .members
+            .iter()
+            .filter(|member| !member.suppressed)
+            .collect();
+        if visible.len() == 1 {
+            describe(&visible[0].source)
+        } else {
+            format!("Candidate group ({} sources)", visible.len())
+        }
     }
+
+    fn is_wildcard(&self) -> bool {
+        matches!(self.members[0].source, SourceRef::DotenvAll { .. })
+    }
+
+    fn visible(&self) -> bool {
+        self.is_wildcard() || self.members.iter().any(|member| !member.suppressed)
+    }
+}
+
+#[derive(Default)]
+struct AliasInventory {
+    sources: HashMap<String, Vec<PathBuf>>,
+    wildcards: Vec<WildcardAliases>,
+}
+
+struct WildcardAliases {
+    scope: Scope,
+    path: PathBuf,
+    values: Vec<String>,
 }
 
 /// Renders a count with a correctly pluralized noun.
@@ -314,6 +410,13 @@ fn describe(source: &SourceRef) -> String {
         SourceRef::DotenvAll { entered, .. } => {
             format!("dotenv {} (every key)", sanitize::text(entered))
         }
+        SourceRef::Json {
+            entered, pointer, ..
+        } => format!(
+            "json {} pointer {}",
+            sanitize::text(entered),
+            sanitize::text(pointer)
+        ),
     }
 }
 
@@ -323,27 +426,45 @@ fn build_items(
     project_root: &Path,
     environment: &Environment,
     home: Option<&Path>,
-) -> Vec<Item> {
+    invocation_directory: &Path,
+    project_files: &discovery::ProjectFiles,
+) -> (Vec<Item>, Vec<known_source::Notice>) {
     let mut resolver = Resolver::new();
     let mut items: Vec<Item> = Vec::new();
 
     // `CFG-015`: existing valid enrollment is preserved by default, including
     // sources that are merely unresolved right now.
     for source in &existing.sources {
-        items.push(item_for(source.clone(), true, &mut resolver, environment));
+        merge_item(
+            &mut items,
+            item_for(source.clone(), true, false, &mut resolver, environment),
+        );
     }
 
-    let known: HashSet<SourceId> = items.iter().map(|item| item.source.id()).collect();
+    let mut known: HashSet<SourceId> = items
+        .iter()
+        .flat_map(|item| &item.members)
+        .map(|member| member.source.id())
+        .collect();
     let mut candidates: Vec<Item> = Vec::new();
+
+    let discovered_known = match scope {
+        Scope::Global => known_source::machine(environment, home, invocation_directory),
+        Scope::Project => known_source::project(project_root, project_files),
+    };
+    for source in discovered_known.sources {
+        if known.insert(source.id()) {
+            candidates.push(item_for(source, false, true, &mut resolver, environment));
+        }
+    }
 
     if scope == Scope::Global {
         // `SET-002`: the current process environment is inspected automatically.
         for name in environment_candidates(environment) {
             let source = SourceRef::Env { name };
-            if known.contains(&source.id()) {
-                continue;
+            if known.insert(source.id()) {
+                candidates.push(item_for(source, false, false, &mut resolver, environment));
             }
-            candidates.push(item_for(source, false, &mut resolver, environment));
         }
     }
 
@@ -351,17 +472,29 @@ fn build_items(
         // `SET-004`: bounded probe locations only.
         Scope::Global => home.map(discovery::global_dotenv_files).unwrap_or_default(),
         // `SET-003`: recursive project discovery.
-        Scope::Project => discovery::project_dotenv_files(project_root),
+        Scope::Project => project_files.dotenv.clone(),
     };
     for file in &discovered {
-        candidates.extend(file_candidates(file, &known, &mut resolver, environment));
+        for candidate in file_candidates(file, &known, &mut resolver, environment) {
+            known.insert(candidate.members[0].source.id());
+            candidates.push(candidate);
+        }
     }
 
-    // Rank suggestions by their advisory signals; gating already decided which
-    // candidates exist at all (`SET-006`).
-    candidates.sort_by_key(|item| std::cmp::Reverse(rank_of(item)));
-    items.extend(candidates);
-    items
+    // Rank suggestions by their admission and advisory signals (`SET-006`,
+    // `SET-017`).
+    candidates.sort_by(|left, right| {
+        rank_of(right).cmp(&rank_of(left)).then_with(|| {
+            left.members[0]
+                .source
+                .id()
+                .cmp(&right.members[0].source.id())
+        })
+    });
+    for candidate in candidates {
+        merge_item(&mut items, candidate);
+    }
+    (items, discovered_known.notices)
 }
 
 fn rank_of(item: &Item) -> u32 {
@@ -369,17 +502,27 @@ fn rank_of(item: &Item) -> u32 {
         None => 0,
         Some(value) => {
             let mut signals = vocabulary::value_signals(value);
-            signals.push(Signal::NameMatches("name"));
+            if item.known_source {
+                signals.push(Signal::KnownSource);
+            }
+            if let Some(signal) = admission_signal(&item.members[0].source, value) {
+                signals.push(signal);
+            }
             vocabulary::rank(&signals)
         }
     }
 }
 
-/// Name-gated environment variables, in a stable order.
+/// Name-gated and credential-bearing URL environment variables, in stable order.
 fn environment_candidates(environment: &Environment) -> Vec<String> {
     let mut names: Vec<String> = environment
         .names()
-        .filter(|name| vocabulary::gating_term(name).is_some())
+        .filter(|name| {
+            vocabulary::gating_term(name).is_some()
+                || environment
+                    .get_str(name)
+                    .is_some_and(credential_url::is_credential_bearing)
+        })
         .map(str::to_string)
         .collect();
     names.sort();
@@ -398,49 +541,63 @@ fn file_candidates(
     };
     dotenv
         .entries()
-        .filter(|(key, value)| !value.is_empty() && vocabulary::gating_term(key).is_some())
+        .filter(|(key, value)| {
+            !value.is_empty()
+                && (vocabulary::gating_term(key).is_some()
+                    || credential_url::is_credential_bearing(value))
+        })
         .map(|(key, _)| SourceRef::DotenvKey {
             entered: entered.clone(),
             path: file.path.clone(),
             key: key.to_string(),
         })
         .filter(|source| !known.contains(&source.id()))
-        .map(|source| item_for(source, false, resolver, environment))
+        .map(|source| item_for(source, false, false, resolver, environment))
         .collect()
 }
 
 fn item_for(
     source: SourceRef,
     enrolled: bool,
+    known_source: bool,
     resolver: &mut Resolver,
     environment: &Environment,
 ) -> Item {
     let mut item = Item {
-        source: source.clone(),
+        members: vec![Member {
+            source: source.clone(),
+            enrolled,
+            suppressed: false,
+        }],
         enrolled,
-        // `SET-007`: gated candidates are selected by default; collision
+        // `SET-007`: automatic candidates are selected by default; collision
         // analysis may unselect them afterwards.
         selected: true,
         detail: String::new(),
         problem: None,
         value: None,
+        resolved: false,
+        wildcard_values: Vec::new(),
         collisions: None,
+        selection_touched: false,
+        known_source,
     };
 
     match resolver.resolve(&source, environment) {
         Resolution::Resolved(secrets) => {
-            let value = secrets.first().map(|secret| secret.value.clone());
+            item.resolved = true;
+            let value = if matches!(source, SourceRef::DotenvAll { .. }) {
+                None
+            } else {
+                secrets.first().map(|secret| secret.value.clone())
+            };
             item.detail = match &value {
                 Some(value) => {
-                    // The gating term explains why the candidate is offered at
-                    // all; value signals only explain its rank (`SET-006`).
-                    let mut signals: Vec<Signal> = source
-                        .id()
-                        .key()
-                        .and_then(vocabulary::gating_term)
-                        .map(Signal::NameMatches)
-                        .into_iter()
-                        .collect();
+                    let mut signals: Vec<Signal> =
+                        admission_signal(&source, value).into_iter().collect();
+                    if known_source {
+                        signals.push(Signal::KnownSource);
+                    }
                     signals.extend(vocabulary::value_signals(value));
                     let described: Vec<String> = signals.iter().map(Signal::describe).collect();
                     if described.is_empty() {
@@ -453,6 +610,7 @@ fn item_for(
             };
             if matches!(source, SourceRef::DotenvAll { .. }) {
                 item.detail = format!("{} current key(s)", secrets.len());
+                item.wildcard_values = secrets.into_iter().map(|secret| secret.value).collect();
             }
             item.value = value;
         }
@@ -474,19 +632,118 @@ fn item_for(
     item
 }
 
+fn admission_signal(source: &SourceRef, value: &str) -> Option<Signal> {
+    source
+        .id()
+        .key()
+        .and_then(vocabulary::gating_term)
+        .map(Signal::NameMatches)
+        .or_else(|| {
+            credential_url::is_credential_bearing(value).then_some(Signal::CredentialBearingUrl)
+        })
+}
+
+fn merge_item(items: &mut Vec<Item>, mut incoming: Item) {
+    if let Some(value) = incoming.value.as_ref()
+        && let Some(existing) = items
+            .iter_mut()
+            .find(|item| item.value.as_ref() == Some(value))
+    {
+        existing.enrolled |= incoming.enrolled;
+        existing.selected |= incoming.selected;
+        existing.selection_touched |= incoming.selection_touched;
+        existing.known_source |= incoming.known_source;
+        existing.members.append(&mut incoming.members);
+        return;
+    }
+    items.push(incoming);
+}
+
+fn alias_inventory<'a>(phases: impl IntoIterator<Item = (Scope, &'a [Item])>) -> AliasInventory {
+    let mut aliases = AliasInventory::default();
+    for (scope, items) in phases {
+        for item in items {
+            if let Some(value) = &item.value {
+                for member in &item.members {
+                    add_alias(&mut aliases.sources, value, member.source.file());
+                }
+            }
+            if item.selected && item.is_wildcard() {
+                aliases.wildcards.push(WildcardAliases {
+                    scope,
+                    path: item.members[0]
+                        .source
+                        .file()
+                        .expect("a wildcard always has a file")
+                        .to_path_buf(),
+                    values: item.wildcard_values.clone(),
+                });
+            }
+        }
+    }
+    aliases
+}
+
+impl AliasInventory {
+    fn sync_wildcards(&mut self, scope: Scope, items: &[Item]) {
+        self.wildcards.retain(|wildcard| wildcard.scope != scope);
+        self.wildcards.extend(
+            items
+                .iter()
+                .filter(|item| item.selected && item.is_wildcard())
+                .map(|item| WildcardAliases {
+                    scope,
+                    path: item.members[0]
+                        .source
+                        .file()
+                        .expect("a wildcard always has a file")
+                        .to_path_buf(),
+                    values: item.wildcard_values.clone(),
+                }),
+        );
+    }
+
+    fn source_files(&self, value: &str) -> Vec<PathBuf> {
+        let mut files = self.sources.get(value).cloned().unwrap_or_default();
+        for wildcard in &self.wildcards {
+            if wildcard.values.iter().any(|known| known == value)
+                && !files.iter().any(|known| known == &wildcard.path)
+            {
+                files.push(wildcard.path.clone());
+            }
+        }
+        files
+    }
+}
+
+fn add_alias(aliases: &mut HashMap<String, Vec<PathBuf>>, value: &str, file: Option<&Path>) {
+    let Some(file) = file else { return };
+    let files = aliases.entry(value.to_string()).or_default();
+    if !files.iter().any(|known| known == file) {
+        files.push(file.to_path_buf());
+    }
+}
+
 fn unresolved_reason(why: Unresolved) -> &'static str {
     why.reason()
 }
 
 /// Runs collision analysis for every resolvable candidate (`SET-011`).
-fn annotate_collisions(items: &mut [Item], project_root: &Path) {
-    let subjects: Vec<collision::Subject<'_>> = items
+fn annotate_collisions(items: &mut [Item], project_root: &Path, aliases: &AliasInventory) {
+    let values: Vec<&str> = items
         .iter()
-        .filter_map(|item| {
-            item.value.as_ref().map(|value| collision::Subject {
-                value,
-                source_file: item.source.file(),
-            })
+        .filter_map(|item| item.value.as_deref())
+        .collect();
+    let source_files: Vec<Vec<PathBuf>> = values
+        .iter()
+        .map(|value| aliases.source_files(value))
+        .collect();
+    let subjects: Vec<collision::Subject<'_>> = values
+        .iter()
+        .zip(&source_files)
+        .map(|(value, source_files)| collision::Subject {
+            value,
+            source_files,
         })
         .collect();
     if subjects.is_empty() {
@@ -502,24 +759,27 @@ fn annotate_collisions(items: &mut [Item], project_root: &Path) {
         let Some(collisions) = report.next() else {
             break;
         };
+        item.collisions = None;
         if !collisions.is_empty() {
             // `SET-007`: a colliding candidate stays visible but unselected,
             // unless it is already enrolled (`CFG-015`).
-            if !item.enrolled {
+            if !item.enrolled && !item.selection_touched {
                 item.selected = false;
             }
             item.collisions = Some(collisions);
+        } else if !item.enrolled && !item.selection_touched {
+            item.selected = true;
         }
     }
 }
 
 fn render(terminal: &mut Terminal<'_>, items: &[Item]) {
     terminal.blank();
-    if items.is_empty() {
+    if visible_count(items) == 0 {
         terminal.line("  (no candidates found)");
         return;
     }
-    for (index, item) in items.iter().enumerate() {
+    for (index, item) in items.iter().filter(|item| item.visible()).enumerate() {
         let marker = match (&item.problem, item.selected) {
             (Some(_), _) => "!",
             (None, true) => "x",
@@ -531,6 +791,18 @@ fn render(terminal: &mut Terminal<'_>, items: &[Item]) {
             index + 1,
             item.description()
         ));
+        if item
+            .members
+            .iter()
+            .filter(|member| !member.suppressed)
+            .count()
+            > 1
+        {
+            for member in item.members.iter().filter(|member| !member.suppressed) {
+                let enrolled = if member.enrolled { " (enrolled)" } else { "" };
+                terminal.line(&format!("        - {}{enrolled}", describe(&member.source)));
+            }
+        }
         if !item.detail.is_empty() {
             terminal.line(&format!("        {}", item.detail));
         }
@@ -550,6 +822,7 @@ fn render_actions(terminal: &mut Terminal<'_>, item_count: usize) {
     terminal.line("  [e]     add env");
     terminal.line("  [k]     add dotenv key");
     terminal.line("  [w]     add wildcard file");
+    terminal.line("  [j]     add JSON field");
     terminal.line("  [Enter] save");
     terminal.line("  [s]     skip");
     terminal.line("  [q]     quit");
@@ -559,24 +832,34 @@ fn render_actions(terminal: &mut Terminal<'_>, item_count: usize) {
 fn blocking_item(items: &[Item]) -> Option<String> {
     items
         .iter()
-        .find(|item| item.selected && item.problem.is_some())
+        .find(|item| item.visible() && item.selected && item.problem.is_some())
         .map(|item| item.description())
 }
 
 fn selected_sources(items: &[Item]) -> Vec<SourceRef> {
     items
         .iter()
-        .filter(|item| item.selected)
-        .map(|item| item.source.clone())
+        .filter(|item| item.selected && item.visible())
+        .flat_map(|item| {
+            item.members
+                .iter()
+                .filter(|member| !member.suppressed)
+                .map(|member| member.source.clone())
+        })
         .collect()
 }
 
 fn toggle(terminal: &mut Terminal<'_>, items: &mut [Item], selection: &str) {
+    let visible: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| item.visible().then_some(index))
+        .collect();
     let mut unknown = Vec::new();
     for token in selection.split_whitespace() {
         match token.parse::<usize>() {
-            Ok(number) if number >= 1 && number <= items.len() => {
-                let item = &mut items[number - 1];
+            Ok(number) if number >= 1 && number <= visible.len() => {
+                let item = &mut items[visible[number - 1]];
                 if item.problem.is_some() && !item.selected {
                     terminal.line(&format!(
                         "  {} is unavailable and cannot be selected.",
@@ -585,6 +868,7 @@ fn toggle(terminal: &mut Terminal<'_>, items: &mut [Item], selection: &str) {
                     continue;
                 }
                 item.selected = !item.selected;
+                item.selection_touched = true;
             }
             _ => unknown.push(sanitize::text(token)),
         }
@@ -594,16 +878,46 @@ fn toggle(terminal: &mut Terminal<'_>, items: &mut [Item], selection: &str) {
     }
 }
 
+fn visible_count(items: &[Item]) -> usize {
+    items.iter().filter(|item| item.visible()).count()
+}
+
+fn update_suppression(items: &mut [Item], aliases: &AliasInventory) {
+    let selected_wildcards: Vec<&Path> = aliases
+        .wildcards
+        .iter()
+        .map(|wildcard| wildcard.path.as_path())
+        .collect();
+    for item in items {
+        if item.is_wildcard() {
+            continue;
+        }
+        for member in &mut item.members {
+            member.suppressed = !member.enrolled
+                && matches!(
+                    &member.source,
+                    SourceRef::DotenvKey { path, .. }
+                        if selected_wildcards.iter().any(|wildcard| *wildcard == path)
+                );
+        }
+    }
+}
+
+fn refresh_items(scope: Scope, items: &mut [Item], context: &mut EnrollmentContext<'_>) {
+    context.aliases.sync_wildcards(scope, items);
+    update_suppression(items, context.aliases);
+    annotate_collisions(items, context.project_root, context.aliases);
+}
+
 /// Manual entry of a source (`SET-005`).
 fn add_manual(
     terminal: &mut Terminal<'_>,
     kind: &str,
+    scope: Scope,
     items: &mut Vec<Item>,
-    config_path: &Path,
-    home: Option<&Path>,
-    environment: &Environment,
+    context: &mut EnrollmentContext<'_>,
 ) -> Result<(), Cancelled> {
-    let base = config_path.parent().unwrap_or(Path::new("."));
+    let base = context.config_path.parent().unwrap_or(Path::new("."));
     let source = match kind {
         "e" => {
             let name = terminal.ask("Environment variable name:")?;
@@ -622,7 +936,7 @@ fn add_manual(
                 terminal.line("  No path entered.");
                 return Ok(());
             }
-            let path = match paths::expand(&entered, base, home) {
+            let path = match paths::expand(&entered, base, context.home) {
                 Ok(path) => path,
                 Err(problem) => {
                     terminal.line(&format!("  That path {}.", problem.reason()));
@@ -656,17 +970,61 @@ fn add_manual(
                 SourceRef::DotenvAll { entered, path }
             }
         }
+        "j" => {
+            let entered = terminal.ask("JSON file path:")?;
+            let entered = entered.trim().to_string();
+            if entered.is_empty() {
+                terminal.line("  No path entered.");
+                return Ok(());
+            }
+            let path = match paths::expand(&entered, base, context.home) {
+                Ok(path) => path,
+                Err(problem) => {
+                    terminal.line(&format!("  That path {}.", problem.reason()));
+                    return Ok(());
+                }
+            };
+            let pointer = terminal.ask("JSON Pointer:")?;
+            if pointer.trim().is_empty() {
+                terminal.line("  No pointer entered.");
+                return Ok(());
+            }
+            let token = match crate::json::final_token(&pointer) {
+                Ok(token) => token,
+                Err(_) => {
+                    terminal.line(
+                        "  Enter a plain RFC 6901 pointer beginning with `/`, with a non-empty final token and no wildcards.",
+                    );
+                    return Ok(());
+                }
+            };
+            SourceRef::Json {
+                entered,
+                path,
+                pointer,
+                token,
+            }
+        }
         _ => return Ok(()),
     };
 
-    if items.iter().any(|item| item.source.id() == source.id()) {
+    if items
+        .iter()
+        .flat_map(|item| &item.members)
+        .any(|member| member.source.id() == source.id())
+    {
         terminal.line("  That source is already listed.");
         return Ok(());
     }
 
     let mut resolver = Resolver::new();
-    let mut item = item_for(source, false, &mut resolver, environment);
-    if item.problem.is_some() || item.value.is_none() {
+    let mut item = item_for(source, false, false, &mut resolver, context.environment);
+    if item.problem.is_some() {
+        terminal.line(&format!("  This source is currently {}.", item.detail));
+        terminal.line("  Not added; repair the source and try again.");
+        return Ok(());
+    }
+    if !item.resolved {
         // `SET-005`: a currently absent manual source may be saved after an
         // explicit confirmation.
         terminal.line(&format!("  This source is currently {}.", item.detail));
@@ -674,10 +1032,20 @@ fn add_manual(
             terminal.line("  Not added.");
             return Ok(());
         }
-        item.problem = None;
     }
     item.selected = true;
-    items.push(item);
+    // Manual entry is itself an affirmative enrollment choice. Collisions stay
+    // visible but do not reverse that choice (`SET-008`).
+    item.selection_touched = true;
+    if let Some(value) = &item.value {
+        add_alias(
+            &mut context.aliases.sources,
+            value,
+            item.members[0].source.file(),
+        );
+    }
+    merge_item(items, item);
+    refresh_items(scope, items, context);
     Ok(())
 }
 

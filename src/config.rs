@@ -70,6 +70,8 @@ pub enum EntryProblem {
     UnexpectedField,
     /// The path cannot be expanded (`CFG-010`).
     InvalidPath(PathProblem),
+    /// A JSON pointer is not a supported plain RFC 6901 pointer (`CFG-016`).
+    InvalidJsonPointer,
     /// The same source identity appears twice in one file (`CFG-006`).
     DuplicateIdentity,
 }
@@ -104,6 +106,7 @@ impl EntryProblem {
                 "sets a field its source type does not accept".to_string()
             }
             EntryProblem::InvalidPath(problem) => problem.reason().to_string(),
+            EntryProblem::InvalidJsonPointer => "has an invalid JSON pointer".to_string(),
             EntryProblem::DuplicateIdentity => "duplicates an earlier source identity".to_string(),
         }
     }
@@ -171,6 +174,7 @@ struct RawSecret {
     file: Option<String>,
     key: Option<String>,
     all: Option<bool>,
+    pointer: Option<String>,
 }
 
 /// Parses configuration text strictly (`CFG-006`).
@@ -212,7 +216,11 @@ fn parse_entry(
     match entry.source.as_str() {
         // `CFG-007`: one non-empty `name` and no dotenv-only fields.
         "env" => {
-            if entry.file.is_some() || entry.key.is_some() || entry.all.is_some() {
+            if entry.file.is_some()
+                || entry.key.is_some()
+                || entry.all.is_some()
+                || entry.pointer.is_some()
+            {
                 return Err(EntryProblem::UnexpectedField);
             }
             let name = entry
@@ -229,7 +237,7 @@ fn parse_entry(
         // `CFG-008`: one non-empty `file` plus exactly one of `key` or
         // `all = true`.
         "dotenv" => {
-            if entry.name.is_some() {
+            if entry.name.is_some() || entry.pointer.is_some() {
                 return Err(EntryProblem::UnexpectedField);
             }
             let file = entry
@@ -259,6 +267,32 @@ fn parse_entry(
                 }),
                 (None, false) => Err(EntryProblem::MissingRequiredField),
             }
+        }
+        // `CFG-016`: an explicit file and one exact plain RFC 6901 pointer.
+        "json" => {
+            if entry.name.is_some() || entry.key.is_some() || entry.all.is_some() {
+                return Err(EntryProblem::UnexpectedField);
+            }
+            let file = entry
+                .file
+                .as_deref()
+                .ok_or(EntryProblem::MissingRequiredField)?;
+            let pointer = entry
+                .pointer
+                .as_deref()
+                .ok_or(EntryProblem::MissingRequiredField)?;
+            if file.is_empty() || pointer.is_empty() {
+                return Err(EntryProblem::EmptyField);
+            }
+            let token =
+                crate::json::final_token(pointer).map_err(|_| EntryProblem::InvalidJsonPointer)?;
+            let path = paths::expand(file, base, home).map_err(EntryProblem::InvalidPath)?;
+            Ok(SourceRef::Json {
+                entered: file.to_string(),
+                path,
+                pointer: pointer.to_string(),
+                token,
+            })
         }
         _ => Err(EntryProblem::UnknownSourceType),
     }
@@ -318,6 +352,11 @@ key = "STRIPE_API_KEY"
 source = "dotenv"
 file = "~/shared/project.env"
 all = true
+
+[[secret]]
+source = "json"
+file = "~/.codex/auth.json"
+pointer = "/tokens/access_token"
 "#,
         )
         .expect("valid config");
@@ -336,6 +375,12 @@ all = true
                 SourceRef::DotenvAll {
                     entered: "~/shared/project.env".to_string(),
                     path: PathBuf::from("/home/user/shared/project.env"),
+                },
+                SourceRef::Json {
+                    entered: "~/.codex/auth.json".to_string(),
+                    path: PathBuf::from("/home/user/.codex/auth.json"),
+                    pointer: "/tokens/access_token".to_string(),
+                    token: "access_token".to_string(),
                 },
             ]
         );
@@ -430,6 +475,46 @@ all = true
         assert_eq!(
             entry_problem("version = 1\n\n[[secret]]\nsource = \"keychain\"\nname = \"A\"\n"),
             EntryProblem::UnknownSourceType
+        );
+    }
+
+    #[test]
+    fn json_entries_are_strict_and_require_a_supported_pointer() {
+        for text in [
+            "version = 1\n\n[[secret]]\nsource = \"json\"\npointer = \"/token\"\n",
+            "version = 1\n\n[[secret]]\nsource = \"json\"\nfile = \"auth.json\"\n",
+        ] {
+            assert_eq!(entry_problem(text), EntryProblem::MissingRequiredField);
+        }
+        for pointer in ["", "/", "/tokens/", "#/token", "token", "/tokens/*", "/~2"] {
+            let text = format!(
+                "version = 1\n\n[[secret]]\nsource = \"json\"\nfile = \"auth.json\"\npointer = {pointer:?}\n"
+            );
+            assert!(matches!(
+                entry_problem(&text),
+                EntryProblem::EmptyField | EntryProblem::InvalidJsonPointer
+            ));
+        }
+        for field in ["name = \"A\"", "key = \"A\"", "all = false"] {
+            let text = format!(
+                "version = 1\n\n[[secret]]\nsource = \"json\"\nfile = \"auth.json\"\npointer = \"/token\"\n{field}\n"
+            );
+            assert_eq!(entry_problem(&text), EntryProblem::UnexpectedField);
+        }
+    }
+
+    #[test]
+    fn json_identity_uses_the_normalized_path_and_exact_case_sensitive_pointer() {
+        let duplicate = "version = 1\n\n[[secret]]\nsource = \"json\"\nfile = \"auth.json\"\npointer = \"/Token\"\n\n[[secret]]\nsource = \"json\"\nfile = \"./nested/../auth.json\"\npointer = \"/Token\"\n";
+        assert_eq!(entry_problem(duplicate), EntryProblem::DuplicateIdentity);
+
+        let distinct = "version = 1\n\n[[secret]]\nsource = \"json\"\nfile = \"auth.json\"\npointer = \"/Token\"\n\n[[secret]]\nsource = \"json\"\nfile = \"auth.json\"\npointer = \"/token\"\n";
+        assert_eq!(
+            parse_text(distinct)
+                .expect("distinct pointers")
+                .sources
+                .len(),
+            2
         );
     }
 
